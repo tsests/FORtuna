@@ -46,14 +46,17 @@ def init_tables():
                 video_hash TEXT NOT NULL,
                 fps FLOAT NOT NULL,
                 frame_number INTEGER NOT NULL,
+                loyalty_threshold FLOAT NOT NULL,
                 original_is_sharp BOOLEAN NOT NULL,
                 corrected_is_sharp BOOLEAN NOT NULL,
                 original_sharpness FLOAT NOT NULL,
                 corrected_sharpness FLOAT NOT NULL,
                 corrected_by TEXT DEFAULT 'user',
                 corrected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (video_hash, fps, frame_number) 
-                    REFERENCES frames(video_hash, fps, frame_number) ON DELETE CASCADE
+                comment TEXT,
+                FOREIGN KEY (video_hash, fps, frame_number, loyalty_threshold) 
+                    REFERENCES frame_classifications(video_hash, fps, frame_number, loyalty_threshold) ON DELETE CASCADE,
+                UNIQUE (video_hash, fps, frame_number, loyalty_threshold, corrected_at)
             );
         """
     }
