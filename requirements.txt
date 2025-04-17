@@ -3,3 +3,7 @@ uvicorn
 pydantic
 psycopg2-binary
 passlib
+minio
+pydantic_settings
+python_multipart
+opencv
