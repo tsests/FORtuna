@@ -6,4 +6,3 @@ passlib
 minio
 pydantic_settings
 python_multipart
-opencv
