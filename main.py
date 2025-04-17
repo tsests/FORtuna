@@ -18,6 +18,10 @@ import cv2
 from typing import Optional
 from fastapi import HTTPException
 from fastapi import Form, File, UploadFile
+import torch
+from torchvision import transforms
+from torchvision.models import mobilenet_v2
+from PIL import Image
 
 # —————————————————————————
 #        ФИКСИРОВАННЫЕ НАСТРОЙКИ
@@ -60,9 +64,9 @@ async def upload_video(
     fps: Optional[float] = Form(None)
 ):
     # Устанавливаем и валидируем значение FPS
-    if fps is None or fps == 0:
+    if fps is None or fps <= 0:
         fps = 0.2  # Значение по умолчанию
-    elif fps < 0 or fps > 60:
+    elif fps > 60:
         return JSONResponse(
             {"status": "error", "message": "FPS must be between 0.01 and 60"},
             status_code=400
@@ -227,8 +231,8 @@ async def get_frames_list(video_hash: str, fps: float):
         frames_list = [
             {
                 "frame_number": frame[0],
-                "url": f"/frames/{video_hash}/{fps}/{frame[0]}",
-                "filename": f"frame_{frame[0]:04d}.jpg"  # Добавлено форматирование имени файла
+                "url": f"/frames/{video_hash}/{fps}/frame_{frame[0]:04d}.jpg"
+                #"filename": f"frame_{frame[0]:04d}.jpg"  # Добавлено форматирование имени файла
             }
             for frame in frames
         ]
@@ -320,39 +324,284 @@ async def classify_video(
     fps: float = Form(...),
     loyalty: float = Form(...)
 ):
-    # Порог
     if not 0 <= loyalty <= 100:
         raise HTTPException(status_code=400, detail="Loyalty must be between 0 and 100")
     thr = 100.0 - loyalty
 
-    # Загружаем модель один раз
-    model = load_model(MODEL_PATH)
+    # Проверяем, есть ли уже результаты для этих параметров
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT fc.frame_number, fc.is_sharp, fc.sharpness_percentage
+                FROM frame_classifications fc
+                JOIN frames f ON fc.video_hash = f.video_hash 
+                    AND fc.fps = f.fps 
+                    AND fc.frame_number = f.frame_number
+                WHERE fc.video_hash = %s 
+                    AND fc.fps = %s 
+                    AND fc.loyalty_threshold = %s
+                ORDER BY fc.frame_number
+            """, (video_hash, fps, thr))
+            
+            existing_results = cur.fetchall()
+            
+            if existing_results:
+                return JSONResponse({
+                    "status": "from_cache",
+                    "results": [{
+                        "frame_number": r[0],
+                        "is_sharp": r[1],
+                        "sharpness_percentage": r[2]
+                    } for r in existing_results]
+                })
 
-    # Получаем ключи кадров
+    # Если результатов нет - выполняем классификацию
+    model = load_model(MODEL_PATH)
     keys = await get_keys(video_hash, fps)
+    
     if not keys:
         raise HTTPException(status_code=404, detail="No frames found")
 
     results = []
-    for key in keys:
-        img = await fetch_frame_image(key)
-        # Разбиение на патчи
-        w, h = img.size
-        pw, ph = w // GRID_SIZE[0], h // GRID_SIZE[1]
-        patches = [img.crop((ix*pw, iy*ph, (ix+1)*pw, (iy+1)*ph))
-                   for iy in range(GRID_SIZE[1]) for ix in range(GRID_SIZE[0])]
-        batch = torch.stack([val_transform(p) for p in patches]).to(DEVICE)
-        with torch.no_grad():
-            logits = model(batch)
-            probs = torch.sigmoid(logits).squeeze(1).cpu().numpy() * 100.0
-        sharp_pct = (probs >= thr).sum() / len(probs) * 100.0
-        label = "sharp" if sharp_pct >= thr else "blur"
-        results.append({"frame_key": key, "pct_sharp_patches": round(sharp_pct,2), "label": label})
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            for key in keys:
+                frame_number = int(key.split('/')[-1].split('_')[1].split('.')[0])
+                
+                img = await fetch_frame_image(key)
+                patches = split_image_to_patches(img)
+                batch = torch.stack([val_transform(p) for p in patches]).to(DEVICE)
+                
+                with torch.no_grad():
+                    logits = model(batch)
+                    probs = torch.sigmoid(logits).squeeze(1).cpu().numpy() * 100.0
+                
+                sharp_pct = (probs >= thr).sum() / len(probs) * 100.0
+                is_sharp = bool(sharp_pct >= thr)  # Явное преобразование в Python bool
+                
+                # Сохраняем результат в БД
+                cur.execute("""
+                    INSERT INTO frame_classifications
+                    (video_hash, fps, frame_number, is_sharp, sharpness_percentage, loyalty_threshold)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    video_hash,
+                    fps,
+                    frame_number,
+                    is_sharp,  # Теперь обычный Python bool
+                    float(sharp_pct),  # Явное преобразование в float
+                    float(thr)  # Явное преобразование в float
+                ))
+                
+                results.append({
+                    "frame_number": frame_number,
+                    "is_sharp": is_sharp,
+                    "sharpness_percentage": round(sharp_pct, 2)
+                })
+            
+            conn.commit()
 
-    # Сохраняем JSON локально и/или возвращаем клиенту
-    output = {"video_hash": video_hash, "fps": fps, "threshold": thr, "results": results}
-    # Можно сохранить в MinIO или файл
-    return JSONResponse(output)
+    return JSONResponse({
+        "status": "processed",
+        "results": results
+    })
+    
+def split_image_to_patches(img: Image.Image) -> list:
+    """Разбивает изображение на патчи согласно GRID_SIZE"""
+    w, h = img.size
+    pw, ph = w // GRID_SIZE[0], h // GRID_SIZE[1]
+    return [img.crop((ix*pw, iy*ph, (ix+1)*pw, (iy+1)*ph))
+            for iy in range(GRID_SIZE[1]) for ix in range(GRID_SIZE[0])]
+            
+@app.get("/classification/{video_hash}/{fps}/{loyalty}/")
+async def get_classification_results(
+    video_hash: str,
+    fps: float,
+    loyalty: float
+):
+    if not 0 <= loyalty <= 100:
+        raise HTTPException(status_code=400, detail="Loyalty must be between 0 and 100")
+    thr = 100.0 - loyalty
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT frame_number, is_sharp, sharpness_percentage
+                FROM frame_classifications
+                WHERE video_hash = %s AND fps = %s AND loyalty_threshold = %s
+                ORDER BY frame_number
+            """, (video_hash, fps, thr))
+            
+            results = cur.fetchall()
+            
+            if not results:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No classification results found for these parameters"
+                )
+
+    return {
+        "video_hash": video_hash,
+        "fps": fps,
+        "loyalty_threshold": thr,
+        "results": [{
+            "frame_number": r[0],
+            "is_sharp": r[1],
+            "sharpness_percentage": r[2]
+        } for r in results]
+    }
+
+@app.post("/correct-classification/")
+async def correct_classification(
+    video_hash: str = Form(...),
+    fps: float = Form(...),
+    frame_number: int = Form(...),
+    is_sharp: bool = Form(...),
+    sharpness_percentage: float = Form(...),
+    user_comment: Optional[str] = Form(None)
+):
+    """
+    Ручная коррекция результатов классификации кадра
+    """
+    # Проверяем существование кадра
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            # Получаем текущие значения
+            cur.execute("""
+                SELECT is_sharp, sharpness_percentage 
+                FROM frame_classifications
+                WHERE video_hash = %s AND fps = %s AND frame_number = %s
+            """, (video_hash, fps, frame_number))
+            
+            current_data = cur.fetchone()
+            if not current_data:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Frame classification not found"
+                )
+
+            original_is_sharp, original_sharpness = current_data
+
+            # Обновляем классификацию
+            cur.execute("""
+                UPDATE frame_classifications
+                SET 
+                    is_sharp = %s,
+                    sharpness_percentage = %s
+                WHERE 
+                    video_hash = %s AND 
+                    fps = %s AND 
+                    frame_number = %s
+                RETURNING *
+            """, (
+                is_sharp, 
+                sharpness_percentage,
+                video_hash,
+                fps,
+                frame_number
+            ))
+
+            # Сохраняем историю изменений
+            cur.execute("""
+                INSERT INTO manual_classification_corrections
+                (
+                    video_hash, fps, frame_number,
+                    original_is_sharp, corrected_is_sharp,
+                    original_sharpness, corrected_sharpness,
+                    corrected_by
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                video_hash,
+                fps,
+                frame_number,
+                original_is_sharp,
+                is_sharp,
+                original_sharpness,
+                sharpness_percentage,
+                "user"  # Можно заменить на реальное имя пользователя из auth
+            ))
+
+            conn.commit()
+
+    return {
+        "status": "success",
+        "message": "Classification updated",
+        "video_hash": video_hash,
+        "fps": fps,
+        "frame_number": frame_number,
+        "new_is_sharp": is_sharp,
+        "new_sharpness": sharpness_percentage,
+        "previous_values": {
+            "is_sharp": original_is_sharp,
+            "sharpness": original_sharpness
+        }
+    }
+
+@app.get("/classification-history/{video_hash}/{fps}/{frame_number}/")
+async def get_classification_history(
+    video_hash: str,
+    fps: float,
+    frame_number: int
+):
+    """
+    Получение истории изменений классификации для конкретного кадра
+    """
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            # Текущая классификация
+            cur.execute("""
+                SELECT is_sharp, sharpness_percentage
+                FROM frame_classifications
+                WHERE video_hash = %s AND fps = %s AND frame_number = %s
+            """, (video_hash, fps, frame_number))
+            
+            current = cur.fetchone()
+            if not current:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Frame not found"
+                )
+
+            # История изменений
+            cur.execute("""
+                SELECT 
+                    corrected_at,
+                    original_is_sharp,
+                    corrected_is_sharp,
+                    original_sharpness,
+                    corrected_sharpness,
+                    corrected_by
+                FROM manual_classification_corrections
+                WHERE 
+                    video_hash = %s AND 
+                    fps = %s AND 
+                    frame_number = %s
+                ORDER BY corrected_at DESC
+            """, (video_hash, fps, frame_number))
+            
+            history = cur.fetchall()
+
+    return {
+        "current": {
+            "is_sharp": current[0],
+            "sharpness_percentage": current[1]
+        },
+        "history": [{
+            "timestamp": record[0].isoformat(),
+            "from": {
+                "is_sharp": record[1],
+                "sharpness": record[3]
+            },
+            "to": {
+                "is_sharp": record[2],
+                "sharpness": record[4]
+            },
+            "corrected_by": record[5]
+        } for record in history]
+    }
+
+
 
 if __name__ == "__main__":
     import uvicorn
