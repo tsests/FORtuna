@@ -19,7 +19,16 @@ from typing import Optional
 from fastapi import HTTPException
 from fastapi import Form, File, UploadFile
 
-
+# —————————————————————————
+#        ФИКСИРОВАННЫЕ НАСТРОЙКИ
+# —————————————————————————
+MODEL_PATH    = "best_model.pth"
+IMG_SIZE      = 224
+GRID_SIZE     = (2, 2)
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+BUCKET_VIDEOS = "videos"
+BUCKET_FRAMES = "frames"
+# —————————————————————————
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -51,9 +60,9 @@ async def upload_video(
     fps: Optional[float] = Form(None)
 ):
     # Устанавливаем и валидируем значение FPS
-    if fps is None:
+    if fps is None or fps == 0:
         fps = 0.2  # Значение по умолчанию
-    elif fps <= 0 or fps > 60:
+    elif fps < 0 or fps > 60:
         return JSONResponse(
             {"status": "error", "message": "FPS must be between 0.01 and 60"},
             status_code=400
@@ -188,7 +197,6 @@ async def upload_video(
             status_code=500
         )
 
-
 @app.get("/frames/{video_hash}/{fps}/")
 async def get_frames_list(video_hash: str, fps: float):
     """
@@ -219,7 +227,8 @@ async def get_frames_list(video_hash: str, fps: float):
         frames_list = [
             {
                 "frame_number": frame[0],
-                "url": f"/frames/{video_hash}/{fps}/{frame[0]}"
+                "url": f"/frames/{video_hash}/{fps}/{frame[0]}",
+                "filename": f"frame_{frame[0]:04d}.jpg"  # Добавлено форматирование имени файла
             }
             for frame in frames
         ]
@@ -260,7 +269,7 @@ async def get_single_frame(video_hash: str, fps: float, frame_number: int):
             return FileResponse(
                 frame_object,
                 media_type="image/jpeg",
-                headers={"Content-Disposition": f"inline; filename=frame_{frame_number}.jpg"}
+                headers={"Content-Disposition": f"inline; filename=frame_{frame_number:04d}.jpg"}  # Исправлено форматирование
             )
         finally:
             frame_object.close()
@@ -272,6 +281,78 @@ async def get_single_frame(video_hash: str, fps: float, frame_number: int):
 @app.get("/preview/{video_hash}/{fps}/")
 async def get_video_preview(video_hash: str, fps: float):
     return await get_single_frame(video_hash, fps, 1)
+
+# Функции для классификации
+val_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225])
+])
+
+def load_model(path: str):
+    model = mobilenet_v2(weights=None)
+    model.classifier[1] = torch.nn.Linear(model.last_channel, 1)
+    sd = torch.load(path, map_location=DEVICE)
+    model.load_state_dict(sd)
+    model.eval().to(DEVICE)
+    return model
+
+async def fetch_frame_image(key: str) -> Image.Image:
+    """Загружает и возвращает PIL.Image из MinIO"""
+    resp = minio_client.get_object(BUCKET_FRAMES, key)
+    data = resp.read()
+    resp.close()
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+async def get_keys(video_hash: str, fps: float) -> list:
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT frame_key FROM frames WHERE video_hash=%s AND fps=%s ORDER BY frame_number",
+            (video_hash, fps)
+        )
+        rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+@app.post("/classify/")
+async def classify_video(
+    video_hash: str = Form(...),
+    fps: float = Form(...),
+    loyalty: float = Form(...)
+):
+    # Порог
+    if not 0 <= loyalty <= 100:
+        raise HTTPException(status_code=400, detail="Loyalty must be between 0 and 100")
+    thr = 100.0 - loyalty
+
+    # Загружаем модель один раз
+    model = load_model(MODEL_PATH)
+
+    # Получаем ключи кадров
+    keys = await get_keys(video_hash, fps)
+    if not keys:
+        raise HTTPException(status_code=404, detail="No frames found")
+
+    results = []
+    for key in keys:
+        img = await fetch_frame_image(key)
+        # Разбиение на патчи
+        w, h = img.size
+        pw, ph = w // GRID_SIZE[0], h // GRID_SIZE[1]
+        patches = [img.crop((ix*pw, iy*ph, (ix+1)*pw, (iy+1)*ph))
+                   for iy in range(GRID_SIZE[1]) for ix in range(GRID_SIZE[0])]
+        batch = torch.stack([val_transform(p) for p in patches]).to(DEVICE)
+        with torch.no_grad():
+            logits = model(batch)
+            probs = torch.sigmoid(logits).squeeze(1).cpu().numpy() * 100.0
+        sharp_pct = (probs >= thr).sum() / len(probs) * 100.0
+        label = "sharp" if sharp_pct >= thr else "blur"
+        results.append({"frame_key": key, "pct_sharp_patches": round(sharp_pct,2), "label": label})
+
+    # Сохраняем JSON локально и/или возвращаем клиенту
+    output = {"video_hash": video_hash, "fps": fps, "threshold": thr, "results": results}
+    # Можно сохранить в MinIO или файл
+    return JSONResponse(output)
 
 if __name__ == "__main__":
     import uvicorn
