@@ -8,3 +8,6 @@ pydantic_settings
 python_multipart
 numpy
 opencv-python
+pillow
+torchvision
+torch
