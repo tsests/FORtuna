@@ -2,7 +2,7 @@
 
 ## Работа тестера
 
-URL: https://docs.google.com/spreadsheets/d/1j8V2_UTXMmGGIpf62Esr9_Q_wEZ6Hq0TgQrx8Uu1n8k/edit?gid=331233788#gid=331233788[https://docs.google.com/spreadsheets/d/1j8V2_UTXMmGGIpf62Esr9_Q_wEZ6Hq0TgQrx8Uu1n8k/edit?gid=331233788#gid=331233788]
+URL: [https://docs.google.com/spreadsheets/d/1j8V2_UTXMmGGIpf62Esr9_Q_wEZ6Hq0TgQrx8Uu1n8k/edit?gid=331233788#gid=331233788]
 
 ## Предварительные требования
 
